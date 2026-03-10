@@ -7,7 +7,9 @@
 
   <summary>Clipboard History Manager</summary>
   
-  <developer_name>Rajnish Tiwari</developer_name>
+  <developer>
+  <name>Rajnish Tiwari</name>
+</developer>
 
   <metadata_license>CC0-1.0</metadata_license>
 
@@ -52,5 +54,29 @@
   </releases>
 
   <content_rating type="oars-1.1"/>
+<description>
+  <p>
+    ClipVault is a modern clipboard history manager for Linux.
+  </p>
+</description>
 
+<screenshots>
+
+  <screenshot type="default">
+    <caption>ClipVault main interface</caption>
+    <image>
+      https://raw.githubusercontent.com/rajnisht7/ClipVault/main/screenshots/image%201.png
+    </image>
+  </screenshot>
+
+  <screenshot>
+    <caption>Clipboard history view</caption>
+    <image>
+      https://raw.githubusercontent.com/rajnisht7/ClipVault/main/screenshots/image2.png
+    </image>
+  </screenshot>
+
+</screenshots>
+
+  
 </component>
