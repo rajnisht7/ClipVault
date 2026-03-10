@@ -45,7 +45,23 @@
   <url type="vcs-browser">
     https://github.com/rajnisht7/ClipVault
   </url>
+    <screenshots>
 
+    <screenshot type="default">
+      <caption>Main ClipVault interface</caption>
+      <image>
+        https://raw.githubusercontent.com/rajnisht7/ClipVault/main/screenshots/image%201.png
+      </image>
+    </screenshot>
+
+    <screenshot>
+      <caption>Clipboard history view</caption>
+      <image>
+        https://raw.githubusercontent.com/rajnisht7/ClipVault/main/screenshots/image2.png
+      </image>
+    </screenshot>
+
+  </screenshots>
 
 
   <releases>
