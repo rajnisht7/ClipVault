@@ -6,6 +6,7 @@
   <name>ClipVault</name>
 
   <summary>Clipboard History Manager</summary>
+  <developer_name>Rajnisht7</developer_name>
 
   <metadata_license>CC0-1.0</metadata_license>
 
@@ -37,6 +38,9 @@
   <url type="bugtracker">
     https://github.com/rajnisht7/clipvault/issues
   </url>
+  <url type="vcs-browser">
+    https://github.com/rajnisht7/ClipVault
+  </url>
 
   <releases>
     <release version="1.0.0" date="2026-03-06">
@@ -47,11 +51,5 @@
   </releases>
 
   <content_rating type="oars-1.1"/>
-
-  <screenshots>
-    <screenshot type="default">
-      <image>https://github.com/rajnisht7/ClipVault/raw/33c7a51cc30494f4d0aa30ede36dae75dcd8a12f/screenshots/image%201.png</image>
-    </screenshot>
-  </screenshots>
 
 </component>
