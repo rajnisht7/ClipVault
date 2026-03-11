@@ -1,8 +1,7 @@
 import os
-import base64
 import subprocess
 import threading
-import tempfile
+import time
 from gi.repository import GLib
 from clipvault.database import add_clip
 
@@ -11,77 +10,59 @@ IMAGE_DIR = os.path.expanduser("~/.local/share/clipvault/images/")
 
 class ClipboardMonitor:
     """
-    wl-paste --watch does NOT pipe command stdout to wl-paste's stdout.
-    The command's output goes to the inherited terminal, not our pipe.
-    That's why all previous base64/cat approaches read nothing from stdout.
+    Simple wl-paste --no-newline polling every 500ms.
 
-    Fix: write clipboard content to a temp file, signal via stdout echo.
-      wl-paste --watch sh -c 'base64 -w0 > TMPFILE; echo READY'
-        - wl-paste: ONE Wayland connection
-        - sh/base64/echo: NOT Wayland clients → zero blinking
-        - base64 output → temp file (avoids stdout pipe issue)
-        - echo READY → goes to wl-paste's stdout → our readline()
-        - Python: reads READY signal → opens temp file → decodes base64
+    Why not --watch: zwlr_data_control_manager_v1 Wayland protocol is
+    restricted inside Flatpak sandbox. --watch never fires.
+
+    Why polling doesn't cause blinking: 500ms interval, one short-lived
+    subprocess — not fast enough for compositor to register focus events.
+    The blinking seen earlier was from --watch echo + wl-paste running
+    two Wayland clients in rapid succession on every clipboard change.
+
+    Binary/image timeout fix: wl-paste hangs on binary content because
+    the clipboard owner takes time to encode data. We use a 1s timeout
+    and only accept returncode=0. Binary content returns non-zero or
+    non-UTF8, both silently skipped.
     """
 
     def __init__(self, on_new_clip):
         self.on_new_clip = on_new_clip
         self.last_text = None
-        self._proc = None
         self._running = False
-        self._tmp = os.path.join(tempfile.gettempdir(),
-                                 f".clipvault_{os.getpid()}")
         os.makedirs(IMAGE_DIR, exist_ok=True)
 
     def start(self, display=None):
         self._running = True
-        threading.Thread(target=self._run, daemon=True).start()
+        threading.Thread(target=self._poll, daemon=True).start()
+        print("[ClipVault] Clipboard polling started")
 
-    def _run(self):
-        try:
-            cmd = f"base64 -w0 > {self._tmp}; echo READY"
-            self._proc = subprocess.Popen(
-                ["wl-paste", "--watch", "sh", "-c", cmd],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-            )
-            print("[ClipVault] started: wl-paste --watch (temp file method)")
+    def _poll(self):
+        while self._running:
+            try:
+                r = subprocess.run(
+                    ["wl-paste", "--no-newline"],
+                    capture_output=True,
+                    timeout=1,          # 1s — binary content gets skipped fast
+                )
+                if r.returncode == 0 and r.stdout:
+                    try:
+                        text = r.stdout.decode("utf-8")
+                    except UnicodeDecodeError:
+                        time.sleep(0.5)
+                        continue        # binary/image — skip silently
 
-            for line in self._proc.stdout:
-                if not self._running:
-                    break
-                if b"READY" not in line:
-                    continue
-                # Signal received — read temp file
-                try:
-                    with open(self._tmp, "rb") as f:
-                        raw = f.read().strip()
-                    if not raw:
-                        continue
-                    text = base64.b64decode(raw).decode("utf-8")
-                    text = text.strip()
                     if text and text != self.last_text:
                         self.last_text = text
                         add_clip('text', content=text, preview=text[:80])
                         GLib.idle_add(self._fire, text)
-                except Exception:
-                    # Binary/image clipboard — skip silently
-                    pass
 
-        except FileNotFoundError:
-            print("[ClipVault] ERROR: wl-paste not found")
-        except Exception as e:
-            print(f"[ClipVault] error: {e}")
-        finally:
-            if self._proc:
-                try:
-                    self._proc.terminate()
-                except Exception:
-                    pass
-            try:
-                os.unlink(self._tmp)
+            except subprocess.TimeoutExpired:
+                pass                    # binary content — skip silently
             except Exception:
                 pass
+
+            time.sleep(0.5)
 
     def _fire(self, text):
         try:
@@ -95,8 +76,3 @@ class ClipboardMonitor:
 
     def stop(self):
         self._running = False
-        if self._proc:
-            try:
-                self._proc.terminate()
-            except Exception:
-                pass
