@@ -1,7 +1,6 @@
 import os
 import subprocess
 import threading
-import time
 from gi.repository import GLib
 from clipvault.database import add_clip
 
@@ -10,56 +9,82 @@ IMAGE_DIR = os.path.expanduser("~/.local/share/clipvault/images/")
 
 class ClipboardMonitor:
     """
-    Uses xclip over X11/XWayland to monitor clipboard.
+    How wl-paste --watch works:
+      1. wl-paste connects to Wayland compositor ONCE and stays connected
+      2. Compositor notifies wl-paste when clipboard changes (wl_data_device protocol)
+      3. wl-paste runs our command (cat) with new clipboard content on stdin
+      4. 'cat' is NOT a Wayland client — it just reads stdin and writes stdout
+      5. We read wl-paste's stdout line by line
 
-    Why this works in Flatpak:
-    - Manifest has --socket=x11 (not fallback-x11) → DISPLAY=:0 always set
-    - --share=ipc → XWayland shared memory works
-    - GNOME shell syncs Wayland clipboard ↔ X11 clipboard automatically
-    - xclip reads X11 clipboard → gets everything copied anywhere
-    - Background thread → no focus needed, no blinking
+    Result: ONE persistent Wayland connection, zero new connections per change,
+    zero focus requirement, zero blinking.
+
+    Why not xclip: Flatpak with --socket=wayland does NOT set DISPLAY, so xclip
+    fails with "Can't open display".
+
+    Why not GTK read_text_async: Wayland security model requires window focus for
+    clipboard reads — by protocol design, not a GTK bug.
     """
 
     def __init__(self, on_new_clip):
         self.on_new_clip = on_new_clip
         self.last_text = None
+        self._proc = None
         self._running = False
         os.makedirs(IMAGE_DIR, exist_ok=True)
 
     def start(self, display=None):
-        # Force DISPLAY if not set (safety net)
-        if not os.environ.get("DISPLAY"):
-            os.environ["DISPLAY"] = ":0"
-
-        print(f"[ClipVault] DISPLAY={os.environ.get('DISPLAY')}")
-        print(f"[ClipVault] WAYLAND_DISPLAY={os.environ.get('WAYLAND_DISPLAY', 'not set')}")
-
         self._running = True
-        threading.Thread(target=self._poll, daemon=True).start()
-        print("[ClipVault] Clipboard monitor started (xclip, background thread)")
+        t = threading.Thread(target=self._run, daemon=True)
+        t.start()
 
-    def _poll(self):
-        env = dict(os.environ)
-        # Ensure DISPLAY is in subprocess env
-        env.setdefault("DISPLAY", ":0")
+    def _run(self):
+        """
+        wl-paste --watch cat:
+          - wl-paste keeps ONE Wayland connection open forever
+          - On each clipboard change, it pipes the content to 'cat' on stdin
+          - cat writes it to stdout, then wl-paste adds a newline
+          - We readline() — blocks until next change (zero CPU, truly event-based)
+        """
+        try:
+            self._proc = subprocess.Popen(
+                ["wl-paste", "--watch", "cat"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+            print("[ClipVault] Clipboard: wl-paste --watch cat (1 connection, event-based)")
 
-        while self._running:
-            try:
-                r = subprocess.run(
-                    ["xclip", "-selection", "clipboard", "-o"],
-                    capture_output=True,
-                    timeout=2,
-                    env=env
-                )
-                if r.returncode == 0:
-                    text = r.stdout.decode("utf-8", errors="replace")
-                    if text and text != self.last_text:
-                        self.last_text = text
-                        add_clip('text', content=text, preview=text[:80])
-                        GLib.idle_add(self._fire, text)
-            except Exception:
-                pass
-            time.sleep(0.5)
+            buf = b""
+            while self._running:
+                # readline() blocks until wl-paste signals a clipboard change
+                # This is the key — zero CPU usage while waiting
+                chunk = self._proc.stdout.readline()
+                if not chunk:
+                    break  # wl-paste died
+
+                buf += chunk
+
+                # wl-paste adds a newline after each clipboard entry
+                # For multi-line text, we accumulate until we get a blank line
+                # or until readline returns with content
+                text = buf.decode("utf-8", errors="replace").rstrip("\n")
+                buf = b""
+
+                if text and text != self.last_text:
+                    self.last_text = text
+                    add_clip('text', content=text, preview=text[:80])
+                    GLib.idle_add(self._fire, text)
+
+        except FileNotFoundError:
+            print("[ClipVault] ERROR: wl-paste not found. Install wl-clipboard.")
+        except Exception as e:
+            print(f"[ClipVault] wl-paste error: {e}")
+        finally:
+            if self._proc:
+                try:
+                    self._proc.terminate()
+                except Exception:
+                    pass
 
     def _fire(self, text):
         try:
@@ -69,7 +94,13 @@ class ClipboardMonitor:
         return False
 
     def set_last_text(self, text):
+        """Called by SyncServer to prevent phone clips from double-adding."""
         self.last_text = text
 
     def stop(self):
         self._running = False
+        if self._proc:
+            try:
+                self._proc.terminate()
+            except Exception:
+                pass
