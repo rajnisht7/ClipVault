@@ -10,7 +10,7 @@ from clipvault.window import ClipVaultWindow
 class ClipVaultApp(Adw.Application):
     def __init__(self):
         super().__init__(
-            application_id="io.github.rajnisht7.clipvault",
+            application_id="io.github.rajnisht7.ClipVault",
             flags=Gio.ApplicationFlags.DEFAULT_FLAGS
         )
         self.connect("activate", self.on_activate)
