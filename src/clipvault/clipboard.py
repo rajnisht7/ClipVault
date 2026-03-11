@@ -1,68 +1,93 @@
 import os
 import subprocess
 import threading
-import time
 from gi.repository import GLib
 from clipvault.database import add_clip
 
 IMAGE_DIR = os.path.expanduser("~/.local/share/clipvault/images/")
+NULL_SEP = b"\x00"  # null byte separator between clipboard entries
 
 
 class ClipboardMonitor:
     """
-    Simple wl-paste --no-newline polling every 500ms.
+    Architecture:
+      wl-paste --watch sh -c 'cat; printf "\\x00"' > FIFO
+                                  ^               ^
+                              clipboard       null separator
+                              on stdin        (signals entry end)
 
-    Why not --watch: zwlr_data_control_manager_v1 Wayland protocol is
-    restricted inside Flatpak sandbox. --watch never fires.
+    wl-paste: ONE Wayland connection, persistent, never reconnects.
+    sh/cat/printf: NOT Wayland clients — zero new connections = zero blinking.
+    FIFO: Python reads from it in background thread, blocks until data arrives.
 
-    Why polling doesn't cause blinking: 500ms interval, one short-lived
-    subprocess — not fast enough for compositor to register focus events.
-    The blinking seen earlier was from --watch echo + wl-paste running
-    two Wayland clients in rapid succession on every clipboard change.
-
-    Binary/image timeout fix: wl-paste hangs on binary content because
-    the clipboard owner takes time to encode data. We use a 1s timeout
-    and only accept returncode=0. Binary content returns non-zero or
-    non-UTF8, both silently skipped.
+    Why FIFO and not stdout pipe:
+      wl-paste --watch forks COMMAND. Depending on implementation,
+      COMMAND may not inherit our stdout pipe cleanly.
+      A named FIFO is explicit — both sides open it independently.
     """
 
     def __init__(self, on_new_clip):
         self.on_new_clip = on_new_clip
         self.last_text = None
+        self._proc = None
         self._running = False
+        self._fifo = f"/tmp/.clipvault_{os.getpid()}.fifo"
         os.makedirs(IMAGE_DIR, exist_ok=True)
 
     def start(self, display=None):
+        # Clean up any stale fifo
+        try:
+            os.unlink(self._fifo)
+        except FileNotFoundError:
+            pass
+        os.mkfifo(self._fifo, 0o600)
+
         self._running = True
-        threading.Thread(target=self._poll, daemon=True).start()
-        print("[ClipVault] Clipboard polling started")
+        # Thread 1: start wl-paste --watch writing to fifo
+        threading.Thread(target=self._start_wlpaste, daemon=True).start()
+        # Thread 2: read from fifo and process entries
+        threading.Thread(target=self._read_fifo, daemon=True).start()
+        print("[ClipVault] started (wl-paste --watch → FIFO, no polling, no blinking)")
 
-    def _poll(self):
-        while self._running:
-            try:
-                r = subprocess.run(
-                    ["wl-paste", "--no-newline"],
-                    capture_output=True,
-                    timeout=1,          # 1s — binary content gets skipped fast
-                )
-                if r.returncode == 0 and r.stdout:
-                    try:
-                        text = r.stdout.decode("utf-8")
-                    except UnicodeDecodeError:
-                        time.sleep(0.5)
-                        continue        # binary/image — skip silently
+    def _start_wlpaste(self):
+        """ONE persistent wl-paste process. Never restarts unless it dies."""
+        try:
+            cmd = f"cat; printf '\\x00'"
+            self._proc = subprocess.Popen(
+                ["wl-paste", "--watch", "sh", "-c", cmd],
+                stdout=open(self._fifo, "wb"),
+                stderr=subprocess.DEVNULL,
+            )
+            self._proc.wait()
+        except Exception as e:
+            print(f"[ClipVault] wl-paste error: {e}")
 
-                    if text and text != self.last_text:
-                        self.last_text = text
-                        add_clip('text', content=text, preview=text[:80])
-                        GLib.idle_add(self._fire, text)
-
-            except subprocess.TimeoutExpired:
-                pass                    # binary content — skip silently
-            except Exception:
-                pass
-
-            time.sleep(0.5)
+    def _read_fifo(self):
+        """Read from FIFO. Blocks until wl-paste writes. No busy loop."""
+        try:
+            # Open FIFO for reading — blocks here until wl-paste opens write end
+            with open(self._fifo, "rb") as f:
+                buf = b""
+                while self._running:
+                    chunk = f.read(4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    # Split on null separator
+                    while NULL_SEP in buf:
+                        entry, buf = buf.split(NULL_SEP, 1)
+                        if entry:
+                            try:
+                                text = entry.decode("utf-8").strip()
+                                if text and text != self.last_text:
+                                    self.last_text = text
+                                    add_clip('text', content=text, preview=text[:80])
+                                    GLib.idle_add(self._fire, text)
+                            except UnicodeDecodeError:
+                                pass  # binary/image — skip
+        except Exception as e:
+            if self._running:
+                print(f"[ClipVault] fifo read error: {e}")
 
     def _fire(self, text):
         try:
@@ -76,3 +101,12 @@ class ClipboardMonitor:
 
     def stop(self):
         self._running = False
+        if self._proc:
+            try:
+                self._proc.terminate()
+            except Exception:
+                pass
+        try:
+            os.unlink(self._fifo)
+        except Exception:
+            pass
