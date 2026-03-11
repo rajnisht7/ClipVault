@@ -139,6 +139,7 @@ class ClipVaultWindow(Adw.ApplicationWindow):
             row = Adw.ActionRow()
             row.set_title("No clips found")
             row.set_subtitle("Copy something to get started!")
+            row.add_css_class("empty-state-row")  # marker so prepend can identify it
             self.list_box.append(row)
             return
 
@@ -148,15 +149,13 @@ class ClipVaultWindow(Adw.ApplicationWindow):
     # ── Prepend single row — for new clips ───────────────────────────────────
 
     def _prepend_row(self, clip):
-        """Insert a new row at position 0 — no rebuild, instant."""
-        # If only 1 row and it's the empty state placeholder, remove it
+        """Insert new row at top. Only removes the empty-state placeholder if present."""
         first = self.list_box.get_row_at_index(0)
-        if first and self.list_box.get_row_at_index(1) is None:
-            # Only one row exists — must be the empty state, safe to remove
-            try:
+        if first:
+            # Only remove if it is the empty-state marker — never remove real clips
+            ctx = first.get_style_context()
+            if ctx.has_class("empty-state-row"):
                 self.list_box.remove(first)
-            except Exception:
-                pass
 
         row = self._build_row(clip)
         self.list_box.prepend(row)
