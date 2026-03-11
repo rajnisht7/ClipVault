@@ -149,14 +149,12 @@ class ClipVaultWindow(Adw.ApplicationWindow):
 
     def _prepend_row(self, clip):
         """Insert a new row at position 0 — no rebuild, instant."""
-        # Remove "no clips" placeholder if present
+        # If only 1 row and it's the empty state placeholder, remove it
         first = self.list_box.get_row_at_index(0)
-        if first:
-            # Check if it's the empty state row (no suffix buttons)
-            # by checking if it has a title of "No clips found"
+        if first and self.list_box.get_row_at_index(1) is None:
+            # Only one row exists — must be the empty state, safe to remove
             try:
-                if first.get_title() == "No clips found":
-                    self.list_box.remove(first)
+                self.list_box.remove(first)
             except Exception:
                 pass
 
