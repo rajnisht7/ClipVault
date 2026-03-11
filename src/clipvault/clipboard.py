@@ -1,82 +1,122 @@
 import os
-import gi
-gi.require_version('Gdk', '4.0')
-from gi.repository import Gdk, GLib
+import subprocess
+import threading
+from gi.repository import GLib
 from clipvault.database import add_clip
 
 IMAGE_DIR = os.path.expanduser("~/.local/share/clipvault/images/")
+SEP = b"CLIPVAULT_SEP"
 
 
 class ClipboardMonitor:
     """
-    Uses GTK4 Gdk.Clipboard directly — no subprocess, no Wayland client spawning,
-    no blinking, no focus stealing.
+    Wayland: ONE persistent wl-paste --watch process.
+      - wl-paste holds a single Wayland connection permanently
+      - On each clipboard change, it pipes content to: sh -c 'cat; printf CLIPVAULT_SEP'
+      - 'sh' and 'cat' are NOT Wayland clients — zero new connections = zero blinking
+      - We read stdout, split on CLIPVAULT_SEP to get each clipboard entry
 
-    On modern GNOME (41+), Mutter caches clipboard data so read_text_async works
-    even when the window is in the background.
-
-    Two triggers:
-      1. 'changed' signal  — fires immediately when clipboard changes (event-based)
-      2. GLib.timeout_add  — 800ms fallback poll, catches anything signal may miss
+    X11: xclip/xsel polling (no native events on X11).
     """
 
     def __init__(self, on_new_clip):
         self.on_new_clip = on_new_clip  # called with (text,)
         self.last_text = None
-        self._reading = False           # guard: no overlapping async reads
-        self._clipboard = None
+        self._running = False
+        self._proc = None
         os.makedirs(IMAGE_DIR, exist_ok=True)
 
-    def start(self, display):
-        self._clipboard = display.get_clipboard()
+    def start(self, display=None):
+        wayland = bool(os.environ.get("WAYLAND_DISPLAY")) or \
+                  os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
 
-        # Primary: event-based — fires on every clipboard change
-        self._clipboard.connect("changed", self._on_changed)
+        if wayland and self._cmd_exists("wl-paste"):
+            self._running = True
+            print("[ClipVault] Clipboard: wl-paste --watch (one persistent connection, no blinking)")
+            threading.Thread(target=self._watch, daemon=True).start()
 
-        # Fallback: slow poll — catches cases where 'changed' fires but
-        # read_text_async was busy (guarded by _reading flag)
-        GLib.timeout_add(800, self._fallback_poll)
+        elif self._cmd_exists("xclip"):
+            self._running = True
+            print("[ClipVault] Clipboard: xclip polling (X11)")
+            threading.Thread(target=self._poll_x11, args=(
+                ["xclip", "-selection", "clipboard", "-o"],), daemon=True).start()
 
-        print("[ClipVault] Clipboard: GTK4 Gdk.Clipboard (no subprocess, no blinking)")
+        elif self._cmd_exists("xsel"):
+            self._running = True
+            print("[ClipVault] Clipboard: xsel polling (X11)")
+            threading.Thread(target=self._poll_x11, args=(
+                ["xsel", "--clipboard", "--output"],), daemon=True).start()
 
-    # ── Triggers ─────────────────────────────────────────────────────────────
+        else:
+            print("[ClipVault] ERROR: No clipboard tool. Install wl-clipboard or xclip.")
 
-    def _on_changed(self, clipboard):
-        """Fires when clipboard content changes — triggered by compositor event."""
-        self._read()
+    # ── Wayland ───────────────────────────────────────────────────────────────
 
-    def _fallback_poll(self):
-        """Slow fallback — only reads if not already reading."""
-        self._read()
-        return True  # keep repeating
+    def _watch(self):
+        """
+        Start ONE wl-paste --watch process. It stays alive forever.
+        On each clipboard change wl-paste pipes content to sh+cat, then prints SEP.
+        We accumulate stdout bytes and split on SEP to get each entry.
 
-    # ── Read ─────────────────────────────────────────────────────────────────
-
-    def _read(self):
-        """Start async clipboard read. Guard prevents overlapping calls."""
-        if self._reading or self._clipboard is None:
-            return
-        self._reading = True
-        self._clipboard.read_text_async(None, self._on_text_ready)
-
-    def _on_text_ready(self, clipboard, result):
-        """Callback — always in GTK main thread (called by GLib event loop)."""
-        self._reading = False
+        wl-paste = 1 Wayland connection, always open, never spawns more.
+        sh/cat   = NOT Wayland clients. No new connections. No blinking.
+        """
         try:
-            text = clipboard.read_text_finish(result)
-            if text and text != self.last_text:
-                self.last_text = text
-                add_clip('text', content=text, preview=text[:80])
-                # Already in GTK main thread — call directly
-                self.on_new_clip(text)
-        except Exception:
-            pass
+            self._proc = subprocess.Popen(
+                ["wl-paste", "--watch", "sh", "-c",
+                 f"cat; printf '{SEP.decode()}'"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+            buf = b""
+            while self._running:
+                chunk = self._proc.stdout.read(256)
+                if not chunk:
+                    break  # process died
+                buf += chunk
+                # Split on sentinel — each clipboard entry ends with SEP
+                while SEP in buf:
+                    entry, buf = buf.split(SEP, 1)
+                    text = entry.decode("utf-8", errors="replace")
+                    self._handle(text)
+        except Exception as e:
+            print(f"[ClipVault] wl-paste --watch failed: {e}")
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
+    def _poll_x11(self, cmd):
+        import time
+        while self._running:
+            try:
+                r = subprocess.run(cmd, capture_output=True, timeout=2)
+                if r.returncode == 0:
+                    self._handle(r.stdout.decode("utf-8", errors="replace"))
+            except Exception:
+                pass
+            time.sleep(0.5)
+
+    # ── Shared ────────────────────────────────────────────────────────────────
+
+    def _handle(self, text):
+        text = text.strip()
+        if not text or text == self.last_text:
+            return
+        self.last_text = text
+        add_clip('text', content=text, preview=text[:80])
+        GLib.idle_add(self.on_new_clip, text)
 
     def set_last_text(self, text):
         """Called by SyncServer — prevents phone clips from double-adding."""
         self.last_text = text
 
     def stop(self):
-        pass  # GLib.timeout_add stops when app exits; no threads to kill
+        self._running = False
+        if self._proc:
+            self._proc.terminate()
+
+    @staticmethod
+    def _cmd_exists(name):
+        try:
+            subprocess.run(["which", name], capture_output=True,
+                           check=True, timeout=2)
+            return True
+        except Exception:
+            return False
