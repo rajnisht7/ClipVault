@@ -139,7 +139,7 @@ class ClipVaultWindow(Adw.ApplicationWindow):
             row = Adw.ActionRow()
             row.set_title("No clips found")
             row.set_subtitle("Copy something to get started!")
-            row.add_css_class("empty-state-row")  # marker so prepend can identify it
+            row._is_empty_state = True  # flag so _prepend_row can identify it
             self.list_box.append(row)
             return
 
@@ -152,9 +152,9 @@ class ClipVaultWindow(Adw.ApplicationWindow):
         """Insert new row at top. Only removes the empty-state placeholder if present."""
         first = self.list_box.get_row_at_index(0)
         if first:
-            # Only remove if it is the empty-state marker — never remove real clips
-            ctx = first.get_style_context()
-            if ctx.has_class("empty-state-row"):
+            # has_class on the child widget, not the row itself
+            # Use a simpler approach: store a flag on the widget
+            if getattr(first, '_is_empty_state', False):
                 self.list_box.remove(first)
 
         row = self._build_row(clip)
