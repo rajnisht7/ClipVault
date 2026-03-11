@@ -9,26 +9,6 @@ IMAGE_DIR = os.path.expanduser("~/.local/share/clipvault/images/")
 
 
 class ClipboardMonitor:
-    """
-    wl-paste --type text/plain --watch sh -c 'base64 -w0; echo'
-
-    Why this solves everything:
-
-    BLINKING: Each subprocess.run() = new Wayland connection = compositor
-    focus event = blinking. --watch keeps ONE connection open forever.
-    base64/sh/echo are NOT Wayland clients. Zero new connections = zero blinking.
-
-    TIMEOUT: wl-paste --no-newline hangs on image/binary clipboard content
-    because it waits for the owner app to provide data. --type text/plain
-    tells wl-paste "only give me text" — if clipboard has image/file,
-    wl-paste skips it instantly instead of hanging.
-
-    READLINE BLOCKING: wl-paste --watch cat outputs "hello" with no \n,
-    readline() waits forever. base64 -w0 converts to single-line base64,
-    echo adds exactly one \n. readline() always returns immediately.
-    Multi-line text also works: "a\nb" → "YQo=" (one line, no internal \n).
-    """
-
     def __init__(self, on_new_clip):
         self.on_new_clip = on_new_clip
         self.last_text = None
@@ -42,13 +22,16 @@ class ClipboardMonitor:
 
     def _run(self):
         try:
+            # No --type flag — match any clipboard change
+            # base64 -w0 → single line (no internal \n), echo → guaranteed \n
+            # readline() always returns immediately
+            # sh/base64/echo are NOT Wayland clients → zero blinking
             self._proc = subprocess.Popen(
-                ["wl-paste", "--type", "text/plain", "--watch",
-                 "sh", "-c", "base64 -w0; echo"],
+                ["wl-paste", "--watch", "sh", "-c", "base64 -w0; echo"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
             )
-            print("[ClipVault] wl-paste --watch base64 started (1 connection, no blinking)")
+            print("[ClipVault] started: wl-paste --watch base64")
 
             for line in self._proc.stdout:
                 if not self._running:
@@ -57,9 +40,14 @@ class ClipboardMonitor:
                 if not line:
                     continue
                 try:
-                    text = base64.b64decode(line).decode("utf-8", errors="replace")
+                    decoded = base64.b64decode(line)
+                    # Try UTF-8 — skip images/binary silently
+                    text = decoded.decode("utf-8")
                 except Exception:
+                    # Not valid base64 or not UTF-8 text (image etc.) — skip
                     continue
+
+                text = text.strip()
                 if text and text != self.last_text:
                     self.last_text = text
                     add_clip('text', content=text, preview=text[:80])
@@ -68,7 +56,7 @@ class ClipboardMonitor:
         except FileNotFoundError:
             print("[ClipVault] ERROR: wl-paste not found")
         except Exception as e:
-            print(f"[ClipVault] Error: {e}")
+            print(f"[ClipVault] error: {e}")
         finally:
             if self._proc:
                 try:
