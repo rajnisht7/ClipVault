@@ -10,15 +10,14 @@ IMAGE_DIR = os.path.expanduser("~/.local/share/clipvault/images/")
 
 class ClipboardMonitor:
     """
-    Uses xclip to poll X11 clipboard in a background thread.
+    Uses xclip over X11/XWayland to monitor clipboard.
 
-    Why xclip and not wl-paste or GTK clipboard:
-    - wl-paste inside Flatpak: Wayland socket restricted → returns empty
-    - GTK read_text_async on Wayland: requires window focus
-    - xclip uses X11 (available via --socket=fallback-x11 in Flatpak manifest)
-    - GNOME shell automatically syncs Wayland clipboard → X11 clipboard
-    - So xclip sees everything copied anywhere, with no focus requirement
-    - Background thread = no GLib/GTK calls = no blinking
+    Why this works in Flatpak:
+    - Manifest has --socket=x11 (not fallback-x11) → DISPLAY=:0 always set
+    - --share=ipc → XWayland shared memory works
+    - GNOME shell syncs Wayland clipboard ↔ X11 clipboard automatically
+    - xclip reads X11 clipboard → gets everything copied anywhere
+    - Background thread → no focus needed, no blinking
     """
 
     def __init__(self, on_new_clip):
@@ -28,25 +27,29 @@ class ClipboardMonitor:
         os.makedirs(IMAGE_DIR, exist_ok=True)
 
     def start(self, display=None):
-        if self._cmd_exists("xclip"):
-            self._running = True
-            print("[ClipVault] Clipboard: xclip polling via X11 (background, no focus needed)")
-            threading.Thread(target=self._poll, daemon=True).start()
-        else:
-            # xclip not found — fall back to GTK timer (focus-dependent but better than nothing)
-            print("[ClipVault] WARNING: xclip not found, falling back to GTK clipboard")
-            print("[ClipVault] Install xclip for background clipboard monitoring")
-            self._clipboard = display.get_clipboard() if display else None
-            if self._clipboard:
-                GLib.timeout_add(500, self._gtk_tick)
+        # Force DISPLAY if not set (safety net)
+        if not os.environ.get("DISPLAY"):
+            os.environ["DISPLAY"] = ":0"
+
+        print(f"[ClipVault] DISPLAY={os.environ.get('DISPLAY')}")
+        print(f"[ClipVault] WAYLAND_DISPLAY={os.environ.get('WAYLAND_DISPLAY', 'not set')}")
+
+        self._running = True
+        threading.Thread(target=self._poll, daemon=True).start()
+        print("[ClipVault] Clipboard monitor started (xclip, background thread)")
 
     def _poll(self):
-        """Background thread — polls xclip every 500ms. No Wayland clients = no blinking."""
+        env = dict(os.environ)
+        # Ensure DISPLAY is in subprocess env
+        env.setdefault("DISPLAY", ":0")
+
         while self._running:
             try:
                 r = subprocess.run(
                     ["xclip", "-selection", "clipboard", "-o"],
-                    capture_output=True, timeout=2
+                    capture_output=True,
+                    timeout=2,
+                    env=env
                 )
                 if r.returncode == 0:
                     text = r.stdout.decode("utf-8", errors="replace")
@@ -57,24 +60,6 @@ class ClipboardMonitor:
             except Exception:
                 pass
             time.sleep(0.5)
-
-    # GTK fallback (only if xclip missing)
-    def _gtk_tick(self):
-        if not getattr(self, '_reading', False):
-            self._reading = True
-            self._clipboard.read_text_async(None, self._gtk_done)
-        return True
-
-    def _gtk_done(self, clipboard, result):
-        self._reading = False
-        try:
-            text = clipboard.read_text_finish(result)
-            if text and text != self.last_text:
-                self.last_text = text
-                add_clip('text', content=text, preview=text[:80])
-                self._fire(text)
-        except Exception:
-            pass
 
     def _fire(self, text):
         try:
@@ -88,11 +73,3 @@ class ClipboardMonitor:
 
     def stop(self):
         self._running = False
-
-    @staticmethod
-    def _cmd_exists(name):
-        try:
-            subprocess.run(["which", name], capture_output=True, check=True, timeout=2)
-            return True
-        except Exception:
-            return False
