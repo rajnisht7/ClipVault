@@ -5,7 +5,88 @@ import time
 from gi.repository import GLib
 from clipvault.database import add_clip
 
+IMAGE_DIR = os.path.import os
+import subprocess
+import threading
+import gi
+gi.require_version('Gdk', '4.0')
+from gi.repository import Gdk, GLib
+from clipvault.database import add_clip
+
 IMAGE_DIR = os.path.expanduser("~/.local/share/clipvault/images/")
+
+
+class ClipboardMonitor:
+    """
+    Uses Gdk.Clipboard 'changed' signal — fired by the Wayland compositor
+    to ALL clients whenever clipboard changes. No polling, no subprocess
+    running constantly, zero blinking.
+
+    Content is read via read_text_async (GTK, no subprocess).
+    wl-paste is never spawned in a loop — only as fallback if GTK read fails.
+    """
+
+    def __init__(self, on_new_clip):
+        self.on_new_clip = on_new_clip  # called with (text,)
+        self.last_text = None
+        self._clipboard = None
+        os.makedirs(IMAGE_DIR, exist_ok=True)
+
+    def start(self, display):
+        self._clipboard = display.get_clipboard()
+        # 'changed' fires on every clipboard change — compositor broadcasts it
+        # to all Wayland clients including us, regardless of window focus
+        self._clipboard.connect("changed", self._on_changed)
+        print("[ClipVault] Clipboard: Gdk.Clipboard 'changed' signal (no polling, no blinking)")
+
+    def _on_changed(self, clipboard):
+        """Compositor told us clipboard changed — read the content."""
+        # Try GTK read first (no subprocess, no Wayland client spawn)
+        clipboard.read_text_async(None, self._on_text_ready)
+
+    def _on_text_ready(self, clipboard, result):
+        try:
+            text = clipboard.read_text_finish(result)
+            if text:
+                self._handle(text)
+                return
+        except Exception:
+            pass
+        # GTK read returned nothing — fall back to wl-paste ONCE (not in a loop)
+        self._read_via_wl_paste()
+
+    def _read_via_wl_paste(self):
+        """Spawned only when GTK read fails — NOT in a loop."""
+        def _run():
+            try:
+                r = subprocess.run(
+                    ["wl-paste", "--no-newline"],
+                    capture_output=True, timeout=2
+                )
+                if r.returncode == 0:
+                    text = r.stdout.decode("utf-8", errors="replace")
+                    if text:
+                        GLib.idle_add(self._handle, text)
+            except Exception:
+                pass
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _handle(self, text):
+        """Must be called in GTK main thread (or via idle_add)."""
+        if not text or text == self.last_text:
+            return False
+        self.last_text = text
+        add_clip('text', content=text, preview=text[:80])
+        self.on_new_clip(text)
+        return False  # for idle_add compatibility
+
+    def set_last_text(self, text):
+        """Called by SyncServer — stops phone clips from re-adding."""
+        self.last_text = text
+
+    def stop(self):
+        pass  # signal-based, nothing to stop
+expanduser("~/.local/share/clipvault/images/")
 
 
 class ClipboardMonitor:
