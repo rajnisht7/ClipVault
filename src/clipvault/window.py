@@ -5,6 +5,7 @@ from gi.repository import Gtk, Adw, Gdk, GLib, GdkPixbuf
 from clipvault.database import get_clips, toggle_pin, delete_clip, clear_all
 from clipvault.clipboard import ClipboardMonitor
 from clipvault.sync_server import SyncServer
+from datetime import datetime
 
 
 class ClipVaultWindow(Adw.ApplicationWindow):
@@ -13,17 +14,17 @@ class ClipVaultWindow(Adw.ApplicationWindow):
         self.set_title("ClipVault")
         self.set_default_size(420, 600)
 
+        # on_new_clip now receives (text) — so we can append instead of rebuild
         self.monitor = ClipboardMonitor(on_new_clip=self._on_pc_clip)
 
         self.sync_server = SyncServer(
-            on_new_clip=self._refresh,
+            on_new_clip=self._on_phone_clip,
             on_connection_change=self._on_connection_change
         )
-        # Give sync_server a reference to monitor so phone clips don't double-fire
         self.sync_server.set_clipboard_monitor(self.monitor)
         self.sync_server.start()
 
-        # ── Layout ──────────────────────────────────────────────
+        # ── Layout ──────────────────────────────────────────────────────────
         toolbar_view = Adw.ToolbarView()
         self.set_content(toolbar_view)
 
@@ -52,14 +53,16 @@ class ClipVaultWindow(Adw.ApplicationWindow):
         content_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         toolbar_view.set_content(content_box)
 
-        search_bar = Gtk.SearchBar()
         self.search_entry = Gtk.SearchEntry()
         self.search_entry.set_placeholder_text("Search clipboard history...")
         self.search_entry.set_hexpand(True)
+        self.search_entry.set_margin_top(8)
+        self.search_entry.set_margin_bottom(4)
+        self.search_entry.set_margin_start(12)
+        self.search_entry.set_margin_end(12)
+        # Search triggers full rebuild (unavoidable when filtering)
         self.search_entry.connect("search-changed", self._on_search)
-        search_bar.set_child(self.search_entry)
-        search_bar.set_search_mode(True)
-        content_box.append(search_bar)
+        content_box.append(self.search_entry)
 
         scrolled = Gtk.ScrolledWindow()
         scrolled.set_vexpand(True)
@@ -69,71 +72,63 @@ class ClipVaultWindow(Adw.ApplicationWindow):
         self.list_box = Gtk.ListBox()
         self.list_box.set_selection_mode(Gtk.SelectionMode.NONE)
         self.list_box.add_css_class("boxed-list")
-        self.list_box.set_margin_top(8)
+        self.list_box.set_margin_top(4)
         self.list_box.set_margin_bottom(8)
         self.list_box.set_margin_start(12)
         self.list_box.set_margin_end(12)
         scrolled.set_child(self.list_box)
 
-        self._refresh()
+        # Initial full load
+        self._full_rebuild()
 
     def start_monitor(self, display):
         self.sync_server.set_display(display)
         self.monitor.start(display)
-        # Clean up monitor thread when window is destroyed
         self.connect("destroy", lambda _: self.monitor.stop())
 
-    # ── Callbacks ────────────────────────────────────────────────
+    # ── Clipboard events ─────────────────────────────────────────────────────
 
-    def _on_pc_clip(self):
-        """Called from ClipboardMonitor — already in GTK main thread."""
-        self._refresh()
-        clips = get_clips(limit=1)
-        if clips:
-            _, clip_type, content, _, _, _, _ = clips[0]
-            if clip_type == 'text' and content:
-                self.sync_server.broadcast_from_pc(content)
+    def _on_pc_clip(self, text):
+        """
+        Called by ClipboardMonitor with the new text.
+        Just prepend — no full rebuild needed.
+        """
+        # If user is searching, full rebuild to keep filter consistent
+        if self.search_entry.get_text():
+            self._full_rebuild()
+        else:
+            # Get the just-saved clip from DB (has id, timestamp etc.)
+            clips = get_clips(limit=1)
+            if clips:
+                self._prepend_row(clips[0])
+            # Push to phone
+            self.sync_server.broadcast_from_pc(text)
 
-    def _refresh(self):
-        """Rebuild clip list. Must always be in GTK main thread."""
-        search = self.search_entry.get_text() if hasattr(self, 'search_entry') else ""
-        clips = get_clips(search=search)
-        self._populate(clips)
+    def _on_phone_clip(self):
+        """
+        Called by SyncServer (via GLib.idle_add) when phone sends a clip.
+        Prepend the latest clip from DB.
+        """
+        if self.search_entry.get_text():
+            self._full_rebuild()
+        else:
+            clips = get_clips(limit=1)
+            if clips:
+                self._prepend_row(clips[0])
+
+    # ── Search ───────────────────────────────────────────────────────────────
 
     def _on_search(self, entry):
-        self._refresh()
+        # Search always does full rebuild with filter
+        self._full_rebuild()
 
-    def _on_connection_change(self, count):
-        """Called via GLib.idle_add — GTK-safe."""
-        if count > 0:
-            self.window_title.set_subtitle(f"📱 {count} phone connected")
-        else:
-            self.window_title.set_subtitle("Clipboard History")
-        return False
+    # ── Full rebuild — only for initial load, search, clear, pin, delete ─────
 
-    def _on_phone_connect(self, btn):
-        try:
-            from clipvault.qr_dialog import QRDialog
-            dialog = QRDialog(
-                self.sync_server.get_phone_url(),
-                self.sync_server.get_url(),
-                self.sync_server
-            )
-            dialog.present(self)
-        except ImportError:
-            dialog = Adw.AlertDialog()
-            dialog.set_heading("Connect Your Phone")
-            dialog.set_body(
-                f"Open this URL on your phone:\n\n{self.sync_server.get_phone_url()}"
-                "\n\n(Install 'qrcode[pil]' for QR code)"
-            )
-            dialog.add_response("ok", "OK")
-            dialog.present(self)
+    def _full_rebuild(self):
+        search = self.search_entry.get_text()
+        clips = get_clips(search=search)
 
-    # ── List population ──────────────────────────────────────────
-
-    def _populate(self, clips):
-        # Walk sibling chain — correct way to remove all GTK4 ListBox children
+        # Remove all existing rows
         child = self.list_box.get_first_child()
         while child:
             nxt = child.get_next_sibling()
@@ -148,10 +143,31 @@ class ClipVaultWindow(Adw.ApplicationWindow):
             return
 
         for clip in clips:
-            clip_id, clip_type, content, image_path, preview, timestamp, pinned = clip
-            self._add_row(clip_id, clip_type, content, image_path, preview, timestamp, pinned)
+            self.list_box.append(self._build_row(clip))
 
-    def _add_row(self, clip_id, clip_type, content, image_path, preview, timestamp, pinned):
+    # ── Prepend single row — for new clips ───────────────────────────────────
+
+    def _prepend_row(self, clip):
+        """Insert a new row at position 0 — no rebuild, instant."""
+        # Remove "no clips" placeholder if present
+        first = self.list_box.get_row_at_index(0)
+        if first:
+            # Check if it's the empty state row (no suffix buttons)
+            # by checking if it has a title of "No clips found"
+            try:
+                if first.get_title() == "No clips found":
+                    self.list_box.remove(first)
+            except Exception:
+                pass
+
+        row = self._build_row(clip)
+        self.list_box.prepend(row)
+
+    # ── Row builder ──────────────────────────────────────────────────────────
+
+    def _build_row(self, clip):
+        clip_id, clip_type, content, image_path, preview, timestamp, pinned = clip
+
         row = Adw.ActionRow()
         row.set_title(GLib.markup_escape_text((preview or "")[:60]))
         row.set_subtitle(timestamp)
@@ -195,9 +211,9 @@ class ClipVaultWindow(Adw.ApplicationWindow):
         btn_box.append(del_btn)
 
         row.add_suffix(btn_box)
-        self.list_box.append(row)
+        return row
 
-    # ── Actions ──────────────────────────────────────────────────
+    # ── Actions ──────────────────────────────────────────────────────────────
 
     def _on_copy(self, btn, content, image_path, clip_type):
         clipboard = self.get_display().get_clipboard()
@@ -211,11 +227,37 @@ class ClipVaultWindow(Adw.ApplicationWindow):
 
     def _on_pin(self, btn, clip_id):
         toggle_pin(clip_id)
-        self._refresh()
+        self._full_rebuild()  # pin reorders list — rebuild needed
 
     def _on_delete(self, btn, clip_id):
         delete_clip(clip_id)
-        self._refresh()
+        self._full_rebuild()
+
+    def _on_connection_change(self, count):
+        if count > 0:
+            self.window_title.set_subtitle(f"📱 {count} phone connected")
+        else:
+            self.window_title.set_subtitle("Clipboard History")
+        return False
+
+    def _on_phone_connect(self, btn):
+        try:
+            from clipvault.qr_dialog import QRDialog
+            dialog = QRDialog(
+                self.sync_server.get_phone_url(),
+                self.sync_server.get_url(),
+                self.sync_server
+            )
+            dialog.present(self)
+        except ImportError:
+            dialog = Adw.AlertDialog()
+            dialog.set_heading("Connect Your Phone")
+            dialog.set_body(
+                f"Open this URL on your phone:\n\n{self.sync_server.get_phone_url()}"
+                "\n\n(Install 'qrcode[pil]' for QR code)"
+            )
+            dialog.add_response("ok", "OK")
+            dialog.present(self)
 
     def _on_clear(self, btn):
         dialog = Adw.AlertDialog()
@@ -230,4 +272,4 @@ class ClipVaultWindow(Adw.ApplicationWindow):
     def _on_clear_response(self, dialog, response):
         if response == "clear":
             clear_all()
-            self._refresh()
+            self._full_rebuild()
