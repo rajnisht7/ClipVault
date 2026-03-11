@@ -1,10 +1,3 @@
-"""
-ClipVault Sync Server
-- WebSocket + HTTP server on local WiFi
-- Phone se clip aaye: GTK clipboard set karo + monitor ko batao (taaki double entry na ho)
-- PC se clip aaye: sab phones ko broadcast karo
-"""
-
 import asyncio
 import json
 import socket
@@ -24,16 +17,27 @@ def get_local_ip():
         s.close()
 
 
+def find_free_port(start=8765, end=8780):
+    """Find first free port in range."""
+    for port in range(start, end):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("0.0.0.0", port))
+                return port
+            except OSError:
+                continue
+    return start  # fallback
+
+
 class SyncServer:
     def __init__(self, on_new_clip, on_connection_change=None, port=8765):
         self.on_new_clip = on_new_clip
         self.on_connection_change = on_connection_change
-        self.port = port
+        self.port = find_free_port(port)  # auto-pick free port
         self.clients = set()
         self.loop = None
         self.thread = None
         self._gtk_display = None
-        # Reference to ClipboardMonitor so we can tell it about phone clips
         self._clipboard_monitor = None
 
     def set_display(self, display):
@@ -70,7 +74,6 @@ class SyncServer:
         self.clients.add(websocket)
         self._notify_connection_change()
         try:
-            # Send history to phone on connect
             clips = get_clips(limit=30)
             recent = [
                 {"type": "text", "content": c[2], "preview": c[4], "timestamp": c[5]}
@@ -83,24 +86,11 @@ class SyncServer:
                     data = json.loads(message)
                     if data.get("action") == "clip" and data.get("content"):
                         content = data["content"]
-
-                        # Save to DB
                         add_clip('text', content=content, preview=content[:80])
-
-                        # FIX Issue 3: Tell clipboard monitor so it doesn't re-detect
-                        # this as a new laptop clip when GTK clipboard is set
                         self._update_monitor_last_text(content)
-
-                        # Set PC clipboard in GTK main thread
                         self._set_gtk_clipboard(content)
-
-                        # Refresh UI in GTK main thread
                         from gi.repository import GLib
                         GLib.idle_add(self._safe_refresh)
-
-                        # FIX Issue 2: Do NOT broadcast back to the sender.
-                        # The phone that sent it already has it locally.
-                        # Only send to OTHER connected phones.
                         await self._broadcast(
                             json.dumps({"action": "clip", "content": content, "preview": content[:80]}),
                             exclude=websocket
@@ -112,7 +102,6 @@ class SyncServer:
             self._notify_connection_change()
 
     def _update_monitor_last_text(self, text):
-        """Tell ClipboardMonitor about this text so it won't double-add it."""
         from gi.repository import GLib
         def _do():
             if self._clipboard_monitor:
