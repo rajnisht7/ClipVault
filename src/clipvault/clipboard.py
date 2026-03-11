@@ -1,7 +1,7 @@
 import os
+import base64
 import subprocess
 import threading
-import time
 from gi.repository import GLib
 from clipvault.database import add_clip
 
@@ -10,71 +10,71 @@ IMAGE_DIR = os.path.expanduser("~/.local/share/clipvault/images/")
 
 class ClipboardMonitor:
     """
-    Uses xclip to poll X11 clipboard in a background thread.
+    wl-paste --type text/plain --watch sh -c 'base64 -w0; echo'
 
-    Why xclip and not wl-paste or GTK clipboard:
-    - wl-paste inside Flatpak: Wayland socket restricted → returns empty
-    - GTK read_text_async on Wayland: requires window focus
-    - xclip uses X11 (available via --socket=fallback-x11 in Flatpak manifest)
-    - GNOME shell automatically syncs Wayland clipboard → X11 clipboard
-    - So xclip sees everything copied anywhere, with no focus requirement
-    - Background thread = no GLib/GTK calls = no blinking
+    Why this solves everything:
+
+    BLINKING: Each subprocess.run() = new Wayland connection = compositor
+    focus event = blinking. --watch keeps ONE connection open forever.
+    base64/sh/echo are NOT Wayland clients. Zero new connections = zero blinking.
+
+    TIMEOUT: wl-paste --no-newline hangs on image/binary clipboard content
+    because it waits for the owner app to provide data. --type text/plain
+    tells wl-paste "only give me text" — if clipboard has image/file,
+    wl-paste skips it instantly instead of hanging.
+
+    READLINE BLOCKING: wl-paste --watch cat outputs "hello" with no \n,
+    readline() waits forever. base64 -w0 converts to single-line base64,
+    echo adds exactly one \n. readline() always returns immediately.
+    Multi-line text also works: "a\nb" → "YQo=" (one line, no internal \n).
     """
 
     def __init__(self, on_new_clip):
         self.on_new_clip = on_new_clip
         self.last_text = None
+        self._proc = None
         self._running = False
         os.makedirs(IMAGE_DIR, exist_ok=True)
 
     def start(self, display=None):
-        if self._cmd_exists("xclip"):
-            self._running = True
-            print("[ClipVault] Clipboard: xclip polling via X11 (background, no focus needed)")
-            threading.Thread(target=self._poll, daemon=True).start()
-        else:
-            # xclip not found — fall back to GTK timer (focus-dependent but better than nothing)
-            print("[ClipVault] WARNING: xclip not found, falling back to GTK clipboard")
-            print("[ClipVault] Install xclip for background clipboard monitoring")
-            self._clipboard = display.get_clipboard() if display else None
-            if self._clipboard:
-                GLib.timeout_add(500, self._gtk_tick)
+        self._running = True
+        threading.Thread(target=self._run, daemon=True).start()
 
-    def _poll(self):
-        """Background thread — polls xclip every 500ms. No Wayland clients = no blinking."""
-        while self._running:
-            try:
-                r = subprocess.run(
-                    ["xclip", "-selection", "clipboard", "-o"],
-                    capture_output=True, timeout=2
-                )
-                if r.returncode == 0:
-                    text = r.stdout.decode("utf-8", errors="replace")
-                    if text and text != self.last_text:
-                        self.last_text = text
-                        add_clip('text', content=text, preview=text[:80])
-                        GLib.idle_add(self._fire, text)
-            except Exception:
-                pass
-            time.sleep(0.5)
-
-    # GTK fallback (only if xclip missing)
-    def _gtk_tick(self):
-        if not getattr(self, '_reading', False):
-            self._reading = True
-            self._clipboard.read_text_async(None, self._gtk_done)
-        return True
-
-    def _gtk_done(self, clipboard, result):
-        self._reading = False
+    def _run(self):
         try:
-            text = clipboard.read_text_finish(result)
-            if text and text != self.last_text:
-                self.last_text = text
-                add_clip('text', content=text, preview=text[:80])
-                self._fire(text)
-        except Exception:
-            pass
+            self._proc = subprocess.Popen(
+                ["wl-paste", "--type", "text/plain", "--watch",
+                 "sh", "-c", "base64 -w0; echo"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+            print("[ClipVault] wl-paste --watch base64 started (1 connection, no blinking)")
+
+            for line in self._proc.stdout:
+                if not self._running:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    text = base64.b64decode(line).decode("utf-8", errors="replace")
+                except Exception:
+                    continue
+                if text and text != self.last_text:
+                    self.last_text = text
+                    add_clip('text', content=text, preview=text[:80])
+                    GLib.idle_add(self._fire, text)
+
+        except FileNotFoundError:
+            print("[ClipVault] ERROR: wl-paste not found")
+        except Exception as e:
+            print(f"[ClipVault] Error: {e}")
+        finally:
+            if self._proc:
+                try:
+                    self._proc.terminate()
+                except Exception:
+                    pass
 
     def _fire(self, text):
         try:
@@ -88,11 +88,8 @@ class ClipboardMonitor:
 
     def stop(self):
         self._running = False
-
-    @staticmethod
-    def _cmd_exists(name):
-        try:
-            subprocess.run(["which", name], capture_output=True, check=True, timeout=2)
-            return True
-        except Exception:
-            return False
+        if self._proc:
+            try:
+                self._proc.terminate()
+            except Exception:
+                pass
