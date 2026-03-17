@@ -18,7 +18,7 @@ jobs:
 
       - name: Build Flatpak
         run: |
-          flatpak-builder build-dir io.github.rajnisht7.ClipVault.yml \
+          flatpak-builder build-dir flatpak/io.github.rajnisht7.ClipVault.yml \
             --install-deps-from=flathub \
             --repo=repo \
             --force-clean
