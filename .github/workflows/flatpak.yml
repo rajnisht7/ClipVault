@@ -1,0 +1,20 @@
+name: Flatpak CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    container:
+      image: ghcr.io/flathub/flatpak-builder:latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - run: |
+          flatpak-builder build-dir io.github.rajnisht7.ClipVault.yml \
+            --install-deps-from=flathub \
+            --force-clean
