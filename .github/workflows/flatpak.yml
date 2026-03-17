@@ -9,7 +9,7 @@ jobs:
     runs-on: ubuntu-latest
 
     container:
-      image: ghcr.io/flathub/flatpak-builder:latest
+      image: ghcr.io/flathub/flatpak-builder:stable
 
     steps:
       - uses: actions/checkout@v4
