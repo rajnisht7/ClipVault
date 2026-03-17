@@ -2,7 +2,13 @@ import os
 from gi.repository import GLib, Gdk
 from clipvault.database import add_clip
 
-IMAGE_DIR = os.path.expanduser("~/.local/share/clipvault/images/")
+def get_storage_dir():
+    return os.path.join(
+        os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share")),
+        "clipvault"
+    )
+
+IMAGE_DIR = os.path.join(get_storage_dir(), "images")
 
 
 class ClipboardMonitor:
