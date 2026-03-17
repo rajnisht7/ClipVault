@@ -9,7 +9,7 @@ from clipvault.database import add_clip, get_clips
 def get_local_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        s.connect(("8.8.8.8", 80))
+        s.connect(("10.255.255.255", 1))
         return s.getsockname()[0]
     except Exception:
         return "127.0.0.1"
