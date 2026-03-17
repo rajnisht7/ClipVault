@@ -18,11 +18,11 @@ jobs:
 
       - name: Add Flathub remote
         run: |
-          sudo flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+          flatpak remote-add --user --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
 
       - name: Build Flatpak
         run: |
-          flatpak-builder build-dir flatpak/io.github.rajnisht7.ClipVault.yml \
+          flatpak-builder --user build-dir flatpak/io.github.rajnisht7.ClipVault.yml \
             --install-deps-from=flathub \
             --repo=repo \
             --force-clean
