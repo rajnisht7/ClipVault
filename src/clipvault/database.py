@@ -2,7 +2,13 @@ import sqlite3
 import os
 from datetime import datetime
 
-DB_PATH = os.path.expanduser("~/.local/share/clipvault/history.db")
+def get_storage_dir():
+    return os.path.join(
+        os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share")),
+        "clipvault"
+    )
+
+DB_PATH = os.path.join(get_storage_dir(), "history.db")
 
 def init_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
